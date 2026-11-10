@@ -270,10 +270,18 @@ def save_notes(path, notes):
     os.makedirs(directory, mode=0o700, exist_ok=True)
     tmp = path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(notes, fh, indent=2, sort_keys=True)
-        fh.write("\n")
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(notes, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        # Do not leave a half-written temp file behind; the original error propagates.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     os.chmod(path, 0o600)
 
 
@@ -299,20 +307,52 @@ def parse_permalink(url):
 # ------------------------------------------------------------- reddit
 
 
+def _invalid_info(reason):
+    return VendorCheckError(
+        "/api/info response is not a valid post listing (%s); nothing was changed"
+        % reason
+    )
+
+
+def _listing_children(payload):
+    """Return data.children of a Listing, or raise if the body is anything else."""
+    if not isinstance(payload, dict):
+        raise _invalid_info("not a JSON object")
+    if "error" in payload:
+        raise _invalid_info("it has an error field")
+    if payload.get("kind") != "Listing":
+        raise _invalid_info("kind is not Listing")
+    data = payload.get("data")
+    children = data.get("children") if isinstance(data, dict) else None
+    if not isinstance(children, list):
+        raise _invalid_info("data.children is missing")
+    return children
+
+
 def fetch_posts(client, post_ids):
-    """GET /api/info for up to 100 t3_ ids; return {post_id: post data}."""
+    """GET /api/info for up to 100 t3_ ids; return {post_id: post data}.
+
+    Fails closed: unless the body is a Listing of t3 posts drawn only from the
+    requested ids, raise instead of returning, so an error body or an
+    unrelated listing is never read as "these posts are gone".
+    """
     if not post_ids or len(post_ids) > INFO_BATCH:
         raise ValueError("expected 1..%d post ids" % INFO_BATCH)
     url = OAUTH_ROOT + "/api/info?" + urllib.parse.urlencode(
         {"id": ",".join("t3_" + pid for pid in post_ids)}
     )
     _, raw = client.request("GET", url)
-    payload = parse_json(raw)
+    requested = set(post_ids)
     found = {}
-    for child in payload.get("data", {}).get("children", []):
-        post = child.get("data", {})
-        if post.get("id"):
-            found[post["id"]] = post
+    for child in _listing_children(parse_json(raw)):
+        if not isinstance(child, dict) or child.get("kind") != "t3":
+            raise _invalid_info("a child is not a t3 post")
+        post = child.get("data")
+        if not isinstance(post, dict) or not isinstance(post.get("id"), str):
+            raise _invalid_info("a post has no id")
+        if post["id"] not in requested:
+            raise _invalid_info("it lists a post that was not requested")
+        found[post["id"]] = post
     return found
 
 
@@ -501,6 +541,14 @@ def main(argv=None, *, opener=None, keychain=None, sleep_fn=time.sleep,
         return COMMANDS[args.command](app, args) or 0
     except VendorCheckError as err:
         print("error: %s" % err, file=sys.stderr)
+        return 1
+    except OSError as err:
+        # Filesystem or system failures (permissions, a directory where a file
+        # should be, a full disk): one line with the reason and path, no traceback.
+        detail = err.strerror or str(err) or err.__class__.__name__
+        if err.filename:
+            detail = "%s: %s" % (detail, err.filename)
+        print("error: %s" % detail, file=sys.stderr)
         return 1
 
 

@@ -67,7 +67,8 @@ def make_post(post_id, subreddit="Peptides", title="Vendor thread report",
 
 def listing_body(children):
     return json.dumps(
-        {"data": {"children": [{"kind": "t3", "data": post} for post in children]}}
+        {"kind": "Listing",
+         "data": {"children": [{"kind": "t3", "data": post} for post in children]}}
     ).encode("utf-8")
 
 
@@ -83,6 +84,7 @@ class FakeReddit:
         self.data_headers = {"x-ratelimit-remaining": "98", "x-ratelimit-reset": "600"}
         self.search_children = [make_post("live1")]
         self.posts = {}  # id -> post dict returned by /api/info
+        self.info_bodies = []  # raw /api/info bodies, one per call, before self.posts
 
     # -- helpers -----------------------------------------------------
     @staticmethod
@@ -105,6 +107,8 @@ class FakeReddit:
             ).encode("utf-8")
         if "/api/info" in url:
             status = self._pop(self.info_statuses)
+            if self.info_bodies:
+                return status, dict(self.data_headers), self.info_bodies.pop(0)
             children = [self.posts[pid] for pid in self._ids(url) if pid in self.posts]
             return status, dict(self.data_headers), listing_body(children)
         if "/search" in url:
@@ -446,6 +450,76 @@ class TestPurge(BaseCase):
         self.assertEqual(len(second_ids), 50)
         self.assertTrue(all(value.startswith("t3_") for value in first_ids + second_ids))
 
+    def notes_bytes(self):
+        with open(self.notes_file, "rb") as fh:
+            return fh.read()
+
+    def assert_purge_refused_and_unchanged(self, before):
+        rc, out, err = self.run_main(["purge"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")  # no counts: nothing was purged
+        self.assertIn("error:", err)
+        self.assertIn("not a valid post listing", err)
+        self.assertEqual(self.notes_bytes(), before)
+
+    def test_purge_non_listing_200_body_changes_nothing(self):
+        # Reddit can answer 200 with an error body or an unrelated listing;
+        # purge must not read that as "every post is gone" and wipe the notes.
+        bodies = {
+            "empty object": b"{}",
+            "error body": json.dumps({"error": 403, "message": "Forbidden"}).encode(),
+            "error field on a listing": json.dumps(
+                {"kind": "Listing", "data": {"children": []}, "error": 500}).encode(),
+            "missing children": json.dumps({"kind": "Listing", "data": {}}).encode(),
+            "missing kind": json.dumps({"data": {"children": []}}).encode(),
+            "wrong kind": json.dumps({"kind": "t1", "data": {"children": []}}).encode(),
+            "not an object": b"[]",
+            "child is not a post": json.dumps(
+                {"kind": "Listing",
+                 "data": {"children": [{"kind": "t1", "data": {"id": "live1"}}]}}).encode(),
+            "unrequested post": listing_body([make_post("other1")]),
+        }
+        for name, body in bodies.items():
+            with self.subTest(body=name):
+                self.write_notes([self.record("live1"), self.record("gone1")])
+                before = self.notes_bytes()
+                self.fake.info_bodies = [body]
+                self.assert_purge_refused_and_unchanged(before)
+
+    def test_purge_invalid_later_batch_changes_nothing(self):
+        # First batch is a valid empty listing (all 100 would be purged), the
+        # second is an error body: the whole purge stops and nothing is saved.
+        self.write_notes([self.record("dead%03d" % i) for i in range(150)])
+        before = self.notes_bytes()
+        self.fake.info_bodies = [listing_body([]), json.dumps({"error": 500}).encode()]
+        self.assert_purge_refused_and_unchanged(before)
+        info_calls = [r for r in self.fake.requests if "/api/info" in r["url"]]
+        self.assertEqual(len(info_calls), 2)
+
+    def test_purge_mixed_valid_listing_deletes_only_dead(self):
+        live1, live2 = self.record("live1"), self.record("live2")
+        live1_again = dict(self.record("live1"), note="second note on the same post")
+        self.write_notes([live1, self.record("dead1"), live2, self.record("rmvd1"),
+                          self.record("miss1"), live1_again])
+        # A real /api/info Listing: extra data fields, miss1 omitted.
+        self.fake.info_bodies = [json.dumps({
+            "kind": "Listing",
+            "data": {
+                "after": None, "before": None, "dist": 4, "modhash": "",
+                "geo_filter": "",
+                "children": [
+                    {"kind": "t3", "data": make_post("live1")},
+                    {"kind": "t3", "data": make_post("dead1", author="[deleted]")},
+                    {"kind": "t3", "data": make_post("live2")},
+                    {"kind": "t3", "data": make_post("rmvd1", removed="moderator")},
+                ],
+            },
+        }).encode("utf-8")]
+        rc, out, err = self.run_main(["purge"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.strip(), "checked=6 deleted=3 kept=3")
+        self.assertEqual(self.read_notes(), [live1, live2, live1_again])
+
 
 class TestRateLimiting(BaseCase):
     def two_request_run(self):
@@ -526,6 +600,55 @@ class TestNoSecrets(BaseCase):
             raw = fh.read()
         for secret in (FAKE_CLIENT_SECRET, FAKE_PASSWORD, FAKE_TOKEN):
             self.assertNotIn(secret, raw)
+
+
+class TestCliErrors(BaseCase):
+    def assert_one_line_error(self, rc, out, err):
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertNotIn("Traceback", err)
+        lines = err.splitlines()
+        self.assertEqual(len(lines), 1, err)
+        self.assertTrue(lines[0].startswith("error: "), err)
+        for secret in (FAKE_CLIENT_ID, FAKE_CLIENT_SECRET, FAKE_PASSWORD, FAKE_TOKEN):
+            self.assertNotIn(secret, err)
+        return lines[0]
+
+    def test_unreadable_notes_file_is_one_line_error(self):
+        os.mkdir(self.notes_file)  # the notes path is a directory: reading it fails
+        rc, out, err = self.run_main(["purge"])
+        line = self.assert_one_line_error(rc, out, err)
+        self.assertIn(self.notes_file, line)
+
+    def test_unwritable_notes_dir_is_one_line_error(self):
+        blocker = os.path.join(self.tmp.name, "blocker")
+        with open(blocker, "w", encoding="utf-8") as fh:
+            fh.write("a regular file where the notes directory should be\n")
+        self.notes_file = os.path.join(blocker, "notes.json")
+        self.config_file = self.write_config()
+        self.fake.posts["abc12"] = make_post("abc12")
+        rc, out, err = self.run_main(
+            ["note", "--url", "https://www.reddit.com/r/Peptides/comments/abc12/x/",
+             "--vendor", "ExampleVendor", "--text", "note text"]
+        )
+        line = self.assert_one_line_error(rc, out, err)
+        self.assertIn(blocker, line)
+
+
+class TestSaveNotes(unittest.TestCase):
+    def test_failed_write_removes_temp_file_and_keeps_original(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "notes.json")
+            vc.save_notes(path, [{"post_id": "live1"}])
+            with open(path, "rb") as fh:
+                before = fh.read()
+            # json.dump writes part of the record, then fails on the object().
+            with self.assertRaises(TypeError):
+                vc.save_notes(path, [{"post_id": "live2", "unserialisable": object()}])
+            self.assertFalse(os.path.exists(path + ".tmp"))
+            self.assertEqual(sorted(os.listdir(tmp)), ["notes.json"])
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), before)
 
 
 class TestConfig(unittest.TestCase):
