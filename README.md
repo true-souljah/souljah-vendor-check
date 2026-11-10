@@ -17,7 +17,8 @@ standard library only; runs as `/usr/bin/python3 vendor_check.py …` on macOS.
   `souljah-vendor-check-password`. Nothing is ever written to the Keychain
   except by `setup-keychain.sh`.
 - **`config.json`**: Reddit username, subreddit allowlist, User-Agent parts,
-  notes path. Copy `config.example.json` to `config.json` to start.
+  notes path. Copy `config.example.json` to `config.json` (next to
+  `vendor_check.py`) to start.
 - **Reddit Data API** (read-only, three endpoints and no others):
   `POST /api/v1/access_token` (OAuth2 script app, password grant — the token
   is kept in memory for that run only and never written to disk or printed),
@@ -32,7 +33,9 @@ Every request carries the User-Agent
 `~/.souljah-vendor-check/notes.json`, mode `600`) with exactly these fields:
 permalink, post id, subreddit, post created_utc, vendor, note text (max 280
 characters), saved_at. It never stores post bodies, comment text, titles or
-usernames. `purge` looks every stored post up via `GET /api/info?id=t3_<id>`
+usernames. The permalink is stored in canonical form (no query string), and
+`note` refuses posts outside the subreddit allowlist and posts that are
+already deleted, removed or not found. `purge` looks every stored post up via `GET /api/info?id=t3_<id>`
 (batched up to 100 ids per call) and deletes the record when the post is
 deleted or removed (author `[deleted]`, `removed_by_category` set, or the
 post is no longer returned); it prints counts only.

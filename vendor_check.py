@@ -15,6 +15,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -25,6 +26,9 @@ from datetime import datetime, timezone
 
 TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 OAUTH_ROOT = "https://oauth.reddit.com"
+DEFAULT_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "config.json"
+)
 
 KEYCHAIN_SERVICES = {
     "client_id": "souljah-vendor-check-client-id",
@@ -38,6 +42,9 @@ DEFAULT_LIMIT = 25
 MAX_LIMIT = 100
 NOTE_MAX_CHARS = 280
 INFO_BATCH = 100            # /api/info accepts up to 100 ids per call
+
+
+POST_ID_RE = re.compile(r"\A[A-Za-z0-9]{1,12}\Z")  # base36 post id
 
 
 class VendorCheckError(Exception):
@@ -90,17 +97,21 @@ def notes_path(cfg):
 
 def read_keychain(service):
     """Read one secret from the macOS Keychain (`security find-generic-password -s <service> -w`)."""
-    result = subprocess.run(
-        ["/usr/bin/security", "find-generic-password", "-s", service, "-w"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["/usr/bin/security", "find-generic-password", "-s", service, "-w"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        raise VendorCheckError("macOS `security` tool not found; this runs on macOS only")
     if result.returncode != 0:
         raise VendorCheckError(
             "keychain lookup failed for %s (run: bash setup-keychain.sh)" % service
         )
-    value = result.stdout.strip()
+    # Only drop the trailing newline `security` adds; spaces may be part of a secret.
+    value = result.stdout.rstrip("\r\n")
     if not value:
         raise VendorCheckError("keychain entry for %s is empty" % service)
     return value
@@ -128,6 +139,13 @@ def default_opener(method, url, headers, data):
         return err.code, {k.lower(): v for k, v in err.headers.items()}, body
     except urllib.error.URLError as err:
         raise VendorCheckError("request failed: %s" % err.reason)
+
+
+def parse_json(raw):
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise VendorCheckError("Reddit returned a response that is not JSON")
 
 
 def _header_float(headers, name):
@@ -223,7 +241,7 @@ def fetch_token(client, creds):
         },
         data=body,
     )
-    payload = json.loads(raw.decode("utf-8"))
+    payload = parse_json(raw)
     token = payload.get("access_token")
     if not token:
         raise VendorCheckError("token response did not include an access token")
@@ -238,7 +256,13 @@ def load_notes(path):
     if not os.path.exists(path):
         return []
     with open(path, "r", encoding="utf-8") as fh:
-        return json.load(fh)
+        try:
+            notes = json.load(fh)
+        except ValueError:
+            raise VendorCheckError("%s is not valid JSON; fix or remove it" % path)
+    if not isinstance(notes, list):
+        raise VendorCheckError("%s must contain a JSON list of records" % path)
+    return notes
 
 
 def save_notes(path, notes):
@@ -255,10 +279,18 @@ def save_notes(path, notes):
 
 def parse_permalink(url):
     """Return (subreddit, post_id) from a /r/<sub>/comments/<id>/... permalink."""
-    path = urllib.parse.urlsplit(url).path
-    parts = [p for p in path.split("/") if p]
-    if len(parts) >= 4 and parts[0].lower() == "r" and parts[2].lower() == "comments":
-        return parts[1], parts[3]
+    split = urllib.parse.urlsplit(url)
+    host = (split.hostname or "").lower()
+    parts = [p for p in split.path.split("/") if p]
+    if (
+        split.scheme in ("http", "https")
+        and (host == "reddit.com" or host.endswith(".reddit.com"))
+        and len(parts) >= 4
+        and parts[0].lower() == "r"
+        and parts[2].lower() == "comments"
+        and POST_ID_RE.match(parts[3])
+    ):
+        return parts[1], parts[3].lower()
     raise VendorCheckError(
         "not a post permalink (expected /r/<subreddit>/comments/<post id>/...)"
     )
@@ -275,7 +307,7 @@ def fetch_posts(client, post_ids):
         {"id": ",".join("t3_" + pid for pid in post_ids)}
     )
     _, raw = client.request("GET", url)
-    payload = json.loads(raw.decode("utf-8"))
+    payload = parse_json(raw)
     found = {}
     for child in payload.get("data", {}).get("children", []):
         post = child.get("data", {})
@@ -317,12 +349,16 @@ def utc_timestamp():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def cmd_search(app, args):
-    allowed = [s.lower() for s in app.cfg["subreddits"]]
-    if args.subreddit.lower() not in allowed:
+def check_allowlisted(cfg, subreddit):
+    allowed = [s.lower() for s in cfg["subreddits"]]
+    if subreddit.lower() not in allowed:
         raise VendorCheckError(
-            "subreddit r/%s is not in the config.json allowlist" % args.subreddit
+            "subreddit r/%s is not in the config.json allowlist" % subreddit
         )
+
+
+def cmd_search(app, args):
+    check_allowlisted(app.cfg, args.subreddit)
     if not 1 <= args.limit <= MAX_LIMIT:
         raise VendorCheckError("limit must be between 1 and %d" % MAX_LIMIT)
     app.authorize()
@@ -338,7 +374,7 @@ def cmd_search(app, args):
         ),
     )
     _, raw = app.client.request("GET", url)
-    listing = json.loads(raw.decode("utf-8"))
+    listing = parse_json(raw)
     for child in listing.get("data", {}).get("children", []):
         post = child.get("data", {})
         permalink = post.get("permalink", "")
@@ -366,14 +402,26 @@ def cmd_note(app, args):
         )
     if not args.text.strip():
         raise VendorCheckError("note text is empty")
+    if not args.vendor.strip():
+        raise VendorCheckError("vendor name is empty")
     subreddit, post_id = parse_permalink(args.url)
+    check_allowlisted(app.cfg, subreddit)
     app.authorize()
     posts = fetch_posts(app.client, [post_id])
-    post = posts.get(post_id, {})
+    post = posts.get(post_id)
+    if post_is_dead(post):
+        raise VendorCheckError(
+            "post t3_%s is deleted, removed or not found; nothing saved" % post_id
+        )
+    subreddit = post.get("subreddit") or subreddit
+    check_allowlisted(app.cfg, subreddit)
+    permalink = post.get("permalink")
     record = {
-        "permalink": args.url,
+        # Canonical permalink without query string or tracking parameters.
+        "permalink": ("https://www.reddit.com" + permalink) if permalink
+        else "https://www.reddit.com/r/%s/comments/%s/" % (subreddit, post_id),
         "post_id": post_id,
-        "subreddit": post.get("subreddit", subreddit),
+        "subreddit": subreddit,
         "created_utc": post.get("created_utc"),
         "vendor": args.vendor,
         "note": args.text,
@@ -392,11 +440,17 @@ def cmd_purge(app, args):
     if not notes:
         print("checked=0 deleted=0 kept=0")
         return 0
-    app.authorize()
+    # A record without a valid post id cannot be checked, so it is dropped.
+    valid = [
+        n for n in notes
+        if isinstance(n, dict) and POST_ID_RE.match(str(n.get("post_id", "")))
+    ]
+    deleted = len(notes) - len(valid)
     kept = []
-    deleted = 0
-    for start in range(0, len(notes), INFO_BATCH):
-        batch = notes[start:start + INFO_BATCH]
+    if valid:
+        app.authorize()
+    for start in range(0, len(valid), INFO_BATCH):
+        batch = valid[start:start + INFO_BATCH]
         posts = fetch_posts(app.client, [n["post_id"] for n in batch])
         for record in batch:
             if post_is_dead(posts.get(record["post_id"])):
@@ -436,9 +490,11 @@ def build_parser():
 
 
 def main(argv=None, *, opener=None, keychain=None, sleep_fn=time.sleep,
-         time_fn=time.time, config_path="config.json"):
+         time_fn=time.time, config_path=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    if config_path is None:
+        config_path = DEFAULT_CONFIG_PATH
     try:
         cfg = load_config(config_path)
         app = App(cfg, opener=opener, keychain=keychain, sleep_fn=sleep_fn, time_fn=time_fn)

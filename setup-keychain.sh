@@ -25,6 +25,6 @@ done
 
 for index in "${!SERVICES[@]}"; do
   service="${SERVICES[$index]}"
-  security add-generic-password -U -s "$service" -w "${VALUES[$index]}"
+  security add-generic-password -U -a "${USER:-$(id -un)}" -s "$service" -w "${VALUES[$index]}"
   printf 'stored %s\n' "$service" >&2
 done

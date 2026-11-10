@@ -8,10 +8,12 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 import urllib.parse
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -346,6 +348,40 @@ class TestNote(BaseCase):
         self.assertIn("not a post permalink", err)
         self.assertEqual(self.fake.requests, [])
 
+    def test_note_refuses_subreddit_not_in_allowlist(self):
+        rc, _, err = self.run_main(
+            ["note", "--url", "https://www.reddit.com/r/Other/comments/abc12/x/",
+             "--vendor", "ExampleVendor", "--text", "note"]
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("not in the config.json allowlist", err)
+        self.assertEqual(self.fake.requests, [])
+
+    def test_note_refuses_deleted_or_missing_post(self):
+        self.fake.posts["abc12"] = make_post("abc12", author="[deleted]")
+        rc, _, err = self.run_main(
+            ["note", "--url", self.PERMALINK, "--vendor", "ExampleVendor",
+             "--text", "note"]
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("nothing saved", err)
+        self.assertFalse(os.path.exists(self.notes_file))
+        del self.fake.posts["abc12"]
+        rc, _, _ = self.run_main(
+            ["note", "--url", self.PERMALINK, "--vendor", "ExampleVendor",
+             "--text", "note"]
+        )
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.exists(self.notes_file))
+
+    def test_note_stores_canonical_permalink(self):
+        rc, _, _ = self.run_main(
+            ["note", "--url", self.PERMALINK + "?utm_source=share&context=3",
+             "--vendor", "ExampleVendor", "--text", "note"]
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.read_notes()[0]["permalink"], self.PERMALINK)
+
 
 class TestPurge(BaseCase):
     def record(self, post_id):
@@ -377,6 +413,20 @@ class TestPurge(BaseCase):
         self.assertEqual(rc, 0)
         self.assertEqual(out.strip(), "checked=0 deleted=0 kept=0")
         self.assertEqual(self.fake.requests, [])
+
+    def test_purge_drops_records_without_valid_post_id(self):
+        self.fake.posts["live1"] = make_post("live1")
+        bad = self.record("x")
+        bad["post_id"] = "bad,id"
+        no_id = self.record("y")
+        del no_id["post_id"]
+        self.write_notes([self.record("live1"), bad, no_id])
+        rc, out, _ = self.run_main(["purge"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "checked=3 deleted=2 kept=1")
+        self.assertEqual([r["post_id"] for r in self.read_notes()], ["live1"])
+        info_calls = [r for r in self.fake.requests if "/api/info" in r["url"]]
+        self.assertEqual(len(info_calls), 1)
 
     def test_purge_batches_at_100_ids(self):
         records = [self.record("dead%03d" % i) for i in range(150)]
@@ -506,6 +556,49 @@ class TestConfig(unittest.TestCase):
         )
         self.assertEqual(sub, "Nootropics")
         self.assertEqual(post_id, "z9y8x7")
+
+    def test_parse_permalink_rejects_other_hosts_and_bad_ids(self):
+        for url in (
+            "https://example.com/r/Peptides/comments/abc12/x/",
+            "https://www.reddit.com/r/Peptides/comments/abc,12/x/",
+            "ftp://www.reddit.com/r/Peptides/comments/abc12/x/",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(vc.VendorCheckError):
+                    vc.parse_permalink(url)
+
+    def test_default_config_path_is_next_to_script(self):
+        self.assertEqual(
+            vc.DEFAULT_CONFIG_PATH,
+            os.path.join(os.path.dirname(os.path.abspath(vc.__file__)), "config.json"),
+        )
+
+
+class TestKeychainReader(unittest.TestCase):
+    def test_reads_with_security_find_generic_password(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="fake value\n", stderr="")
+
+        with mock.patch.object(vc.subprocess, "run", fake_run):
+            value = vc.read_keychain("souljah-vendor-check-client-id")
+        self.assertEqual(value, "fake value")  # inner space kept, newline dropped
+        self.assertEqual(
+            calls,
+            [["/usr/bin/security", "find-generic-password", "-s",
+              "souljah-vendor-check-client-id", "-w"]],
+        )
+
+    def test_missing_entry_error_does_not_leak(self):
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 44, stdout="", stderr="not found")
+
+        with mock.patch.object(vc.subprocess, "run", fake_run):
+            with self.assertRaises(vc.VendorCheckError) as ctx:
+                vc.read_keychain("souljah-vendor-check-password")
+        self.assertIn("setup-keychain.sh", str(ctx.exception))
 
 
 if __name__ == "__main__":
