@@ -1,0 +1,8 @@
+{
+  "username": "true_souljah",
+  "platform": "macos",
+  "app_id": "souljah-vendor-check",
+  "version": "1.0",
+  "subreddits": ["Peptides", "Nootropics"],
+  "notes_path": "~/.souljah-vendor-check/notes.json"
+}
