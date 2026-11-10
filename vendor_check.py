@@ -314,19 +314,35 @@ def _invalid_info(reason):
     )
 
 
-def _listing_children(payload):
-    """Return data.children of a Listing, or raise if the body is anything else."""
+def _invalid_search(reason):
+    return VendorCheckError("search response is not a valid post listing (%s)" % reason)
+
+
+def _listing_posts(payload, invalid):
+    """Return the post dicts of a Listing of t3 children with string ids.
+
+    Raises invalid(reason) for anything else, so an error body is never read
+    as an empty result.
+    """
     if not isinstance(payload, dict):
-        raise _invalid_info("not a JSON object")
+        raise invalid("not a JSON object")
     if "error" in payload:
-        raise _invalid_info("it has an error field")
+        raise invalid("it has an error field")
     if payload.get("kind") != "Listing":
-        raise _invalid_info("kind is not Listing")
+        raise invalid("kind is not Listing")
     data = payload.get("data")
     children = data.get("children") if isinstance(data, dict) else None
     if not isinstance(children, list):
-        raise _invalid_info("data.children is missing")
-    return children
+        raise invalid("data.children is missing")
+    posts = []
+    for child in children:
+        if not isinstance(child, dict) or child.get("kind") != "t3":
+            raise invalid("a child is not a t3 post")
+        post = child.get("data")
+        if not isinstance(post, dict) or not isinstance(post.get("id"), str):
+            raise invalid("a post has no id")
+        posts.append(post)
+    return posts
 
 
 def fetch_posts(client, post_ids):
@@ -344,12 +360,7 @@ def fetch_posts(client, post_ids):
     _, raw = client.request("GET", url)
     requested = set(post_ids)
     found = {}
-    for child in _listing_children(parse_json(raw)):
-        if not isinstance(child, dict) or child.get("kind") != "t3":
-            raise _invalid_info("a child is not a t3 post")
-        post = child.get("data")
-        if not isinstance(post, dict) or not isinstance(post.get("id"), str):
-            raise _invalid_info("a post has no id")
+    for post in _listing_posts(parse_json(raw), _invalid_info):
         if post["id"] not in requested:
             raise _invalid_info("it lists a post that was not requested")
         found[post["id"]] = post
@@ -414,9 +425,7 @@ def cmd_search(app, args):
         ),
     )
     _, raw = app.client.request("GET", url)
-    listing = parse_json(raw)
-    for child in listing.get("data", {}).get("children", []):
-        post = child.get("data", {})
+    for post in _listing_posts(parse_json(raw), _invalid_search):
         permalink = post.get("permalink", "")
         if permalink:
             print("https://www.reddit.com" + permalink)
@@ -480,26 +489,37 @@ def cmd_purge(app, args):
     if not notes:
         print("checked=0 deleted=0 kept=0")
         return 0
-    # A record without a valid post id cannot be checked, so it is dropped.
-    valid = [
-        n for n in notes
-        if isinstance(n, dict) and POST_ID_RE.match(str(n.get("post_id", "")))
-    ]
-    deleted = len(notes) - len(valid)
-    kept = []
-    if valid:
+    # Only a valid listing showing a post dead or absent deletes its record.
+    # A record without a valid post id cannot be checked, so it is kept as is.
+    checkable, unchecked = [], []  # checkable holds (index in notes, record)
+    for index, record in enumerate(notes):
+        post_id = record.get("post_id") if isinstance(record, dict) else None
+        if isinstance(post_id, str) and POST_ID_RE.match(post_id):
+            checkable.append((index, record))
+        else:
+            unchecked.append(record)
+    dead = set()  # indices in notes of records to delete
+    if checkable:
         app.authorize()
-    for start in range(0, len(valid), INFO_BATCH):
-        batch = valid[start:start + INFO_BATCH]
-        posts = fetch_posts(app.client, [n["post_id"] for n in batch])
-        for record in batch:
-            if post_is_dead(posts.get(record["post_id"])):
-                deleted += 1
-            else:
-                kept.append(record)
-    if deleted:
+    for start in range(0, len(checkable), INFO_BATCH):
+        batch = checkable[start:start + INFO_BATCH]
+        posts = fetch_posts(app.client, [n["post_id"] for _, n in batch])
+        dead.update(i for i, n in batch if post_is_dead(posts.get(n["post_id"])))
+    kept = [n for i, n in enumerate(notes) if i not in dead]
+    if dead:
         save_notes(path, kept)
-    print("checked=%d deleted=%d kept=%d" % (len(notes), deleted, len(kept)))
+    print("checked=%d deleted=%d kept=%d" % (len(notes), len(dead), len(kept)))
+    if unchecked:
+        print(
+            "warning: kept %d record%s with no valid post id (not checked):"
+            % (len(unchecked), "" if len(unchecked) == 1 else "s"),
+            file=sys.stderr,
+        )
+        for record in unchecked:
+            # Permalink only, never the note text; skip anything unprintable.
+            link = record.get("permalink") if isinstance(record, dict) else None
+            ok = isinstance(link, str) and link != "" and link.isprintable()
+            print("  " + (link if ok else "(no printable permalink)"), file=sys.stderr)
     return 0
 
 

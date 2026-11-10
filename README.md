@@ -38,7 +38,11 @@ usernames. The permalink is stored in canonical form (no query string), and
 already deleted, removed or not found. `purge` looks every stored post up via `GET /api/info?id=t3_<id>`
 (batched up to 100 ids per call) and deletes the record when the post is
 deleted or removed (author `[deleted]`, `removed_by_category` set, or the
-post is no longer returned); it prints counts only.
+post is no longer returned); it prints counts only. A record without a
+valid post id cannot be checked, so it is kept unchanged and listed on
+stderr by permalink (never by note text). If `/api/info` answers with
+anything other than a post listing, `purge` stops with an error and
+changes nothing.
 
 ## Rate limits
 
@@ -66,7 +70,9 @@ HTTP 429 it waits for the reset and retries once, then stops with an error.
 ```
 
 `search` prints, per post: permalink URL, subreddit, created date (UTC),
-score, title. `--limit` defaults to 25 and is capped at 100. Only subreddits
+score, title. A search response that is not a post listing (for example
+an error body) is an error (exit 1), not an empty result. `--limit`
+defaults to 25 and is capped at 100. Only subreddits
 listed in `config.json` `"subreddits"` can be searched; anything else is
 refused. No streaming, no background service, no data export.
 

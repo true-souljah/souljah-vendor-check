@@ -83,6 +83,7 @@ class FakeReddit:
         self.token_headers = {"x-ratelimit-remaining": "98", "x-ratelimit-reset": "600"}
         self.data_headers = {"x-ratelimit-remaining": "98", "x-ratelimit-reset": "600"}
         self.search_children = [make_post("live1")]
+        self.search_bodies = []  # raw search bodies, one per call, before search_children
         self.posts = {}  # id -> post dict returned by /api/info
         self.info_bodies = []  # raw /api/info bodies, one per call, before self.posts
 
@@ -113,6 +114,8 @@ class FakeReddit:
             return status, dict(self.data_headers), listing_body(children)
         if "/search" in url:
             status = self._pop(self.search_statuses)
+            if self.search_bodies:
+                return status, dict(self.data_headers), self.search_bodies.pop(0)
             return status, dict(self.data_headers), listing_body(self.search_children)
         raise AssertionError("unexpected url: %s" % url)
 
@@ -259,6 +262,50 @@ class TestSearch(BaseCase):
         self.assertIn("2024-01-02 09:04 UTC", out)
         self.assertIn("score 42", out)
         self.assertIn("Peptide vendor report", out)
+
+    def test_search_non_listing_200_body_is_an_error(self):
+        # A 200 that is not a post Listing is an API failure, not "no reports":
+        # it must exit 1 with one stderr line and print nothing on stdout.
+        bodies = {
+            "not an object": b"[]",
+            "empty object": b"{}",
+            "error body": json.dumps({"error": 403, "message": "Forbidden"}).encode(),
+            "error field on a listing": json.dumps(
+                {"kind": "Listing", "data": {"children": []}, "error": 500}).encode(),
+            "missing children": json.dumps({"kind": "Listing", "data": {}}).encode(),
+            "wrong kind": json.dumps({"kind": "t1", "data": {"children": []}}).encode(),
+            "child is not a post": json.dumps(
+                {"kind": "Listing",
+                 "data": {"children": [{"kind": "t1", "data": {"id": "abc12"}}]}}).encode(),
+            "post without string id": json.dumps(
+                {"kind": "Listing",
+                 "data": {"children": [{"kind": "t3", "data": {"id": 12345}}]}}).encode(),
+        }
+        for name, body in bodies.items():
+            with self.subTest(body=name):
+                self.fake.search_bodies = [body]
+                rc, out, err = self.run_main(
+                    ["search", "--subreddit", "Peptides", "--query", "vendor"]
+                )
+                self.assertEqual(rc, 1)
+                self.assertEqual(out, "")
+                self.assertNotIn("Traceback", err)
+                lines = err.splitlines()
+                self.assertEqual(len(lines), 1, err)
+                self.assertTrue(
+                    lines[0].startswith(
+                        "error: search response is not a valid post listing ("),
+                    err,
+                )
+
+    def test_search_valid_empty_listing_exits_0(self):
+        self.fake.search_bodies = [listing_body([])]
+        rc, out, err = self.run_main(
+            ["search", "--subreddit", "Peptides", "--query", "vendor"]
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out, "")
+        self.assertEqual(err, "")
 
 
 class TestNote(BaseCase):
@@ -418,19 +465,69 @@ class TestPurge(BaseCase):
         self.assertEqual(out.strip(), "checked=0 deleted=0 kept=0")
         self.assertEqual(self.fake.requests, [])
 
-    def test_purge_drops_records_without_valid_post_id(self):
-        self.fake.posts["live1"] = make_post("live1")
-        bad = self.record("x")
+    def invalid_records(self):
+        """Records purge cannot check; each note text is unique so leaks show."""
+        bad = dict(self.record("x"), note="NOTETEXT-bad")
         bad["post_id"] = "bad,id"
-        no_id = self.record("y")
+        no_id = dict(self.record("y"), note="NOTETEXT-noid")
         del no_id["post_id"]
-        self.write_notes([self.record("live1"), bad, no_id])
-        rc, out, _ = self.run_main(["purge"])
-        self.assertEqual(rc, 0)
-        self.assertEqual(out.strip(), "checked=3 deleted=2 kept=1")
-        self.assertEqual([r["post_id"] for r in self.read_notes()], ["live1"])
+        int_id = dict(self.record("z"), note="NOTETEXT-int")
+        int_id["post_id"] = 12345
+        escape = dict(self.record("w"), note="NOTETEXT-esc",
+                      permalink="https://www.reddit.com/r/x/\x1b[2J")
+        escape["post_id"] = "../w"
+        return [bad, no_id, int_id, escape, "NOTETEXT-stray"]
+
+    def test_purge_keeps_records_without_valid_post_id(self):
+        # Unverifiable records are never deleted: kept as-is, reported on stderr
+        # by count and permalink (never note text), and not sent to /api/info.
+        self.fake.posts["live1"] = make_post("live1")
+        self.write_notes([self.record("live1")] + self.invalid_records())
+        before = self.notes_bytes()
+        rc, out, err = self.run_main(["purge"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.strip(), "checked=6 deleted=0 kept=6")
+        self.assertEqual(self.notes_bytes(), before)
         info_calls = [r for r in self.fake.requests if "/api/info" in r["url"]]
         self.assertEqual(len(info_calls), 1)
+        self.assertEqual(
+            urllib.parse.parse_qs(urllib.parse.urlsplit(info_calls[0]["url"]).query)["id"],
+            ["t3_live1"],
+        )
+        lines = err.splitlines()
+        self.assertTrue(lines[0].startswith("warning: kept 5 records with no valid post id"), err)
+        self.assertEqual(lines[1:], [
+            "  https://www.reddit.com/r/Peptides/comments/x/x/",
+            "  https://www.reddit.com/r/Peptides/comments/y/x/",
+            "  https://www.reddit.com/r/Peptides/comments/z/x/",
+            "  (no printable permalink)",
+            "  (no printable permalink)",
+        ])
+        self.assertNotIn("NOTETEXT", err + out)
+        self.assertNotIn("\x1b", err)
+
+    def test_purge_keeps_invalid_record_while_purging_dead_ones(self):
+        self.fake.posts["live1"] = make_post("live1")
+        bad = self.invalid_records()[0]
+        # gone1 is not returned by /api/info, so it is purged.
+        self.write_notes([bad, self.record("gone1"), self.record("live1")])
+        rc, out, err = self.run_main(["purge"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.strip(), "checked=3 deleted=1 kept=2")
+        self.assertEqual(self.read_notes(), [bad, self.record("live1")])
+        self.assertIn("warning: kept 1 record with no valid post id", err)
+        self.assertIn("  https://www.reddit.com/r/Peptides/comments/x/x/", err)
+        self.assertNotIn("NOTETEXT", err + out)
+
+    def test_purge_only_invalid_records_makes_no_request(self):
+        self.write_notes(self.invalid_records())
+        before = self.notes_bytes()
+        rc, out, err = self.run_main(["purge"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.strip(), "checked=5 deleted=0 kept=5")
+        self.assertEqual(self.notes_bytes(), before)
+        self.assertEqual(self.fake.requests, [])
+        self.assertIn("warning: kept 5 records with no valid post id", err)
 
     def test_purge_batches_at_100_ids(self):
         records = [self.record("dead%03d" % i) for i in range(150)]
